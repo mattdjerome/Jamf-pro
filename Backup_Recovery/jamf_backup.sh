@@ -20,6 +20,7 @@
 #   --compliance             Export compliance benchmarks (JSON per benchmark)
 #   --computers              Export full computer inventory (single JSON file)
 #   --app-installers         Export app installer deployments (JSON per deployment)
+#   --scripts                Export scripts (XML per script)
 #
 # Restore Options:
 #   --all                    Restore everything
@@ -31,6 +32,7 @@
 #   --packages               Upload package files to JCDS
 #   --blueprints             Restore blueprints
 #   --app-installers         Restore app installer deployments
+#   --scripts                Restore scripts
 #   --source <path>          Specific dated backup folder to restore from
 #                            Default: most recent under OUTPUT_BASE
 #   --target-url <url>       Jamf Pro URL to restore to
@@ -38,8 +40,8 @@
 #   --no-prompt              Skip all conflict prompts; overwrite everything
 #
 # Global Options:
-#   --client-id      OAuth client ID for Classic API access
-#   --client-secret  OAuth client secret for Classic API access
+#   --client-id      OAuth client ID for Classic API access (env: JAMF_CLIENT_ID)
+#   --client-secret  OAuth client secret for Classic API access (env: JAMF_CLIENT_SECRET)
 #   --output-dir <path>      Base output directory (default: ~/Desktop/Jamf_Pro_Backup)
 #   --log-file <path>        Log file path (default: <output-dir>/jamf_cli_logs.log)
 #   -n, --dry-run            Preview all commands without executing
@@ -49,7 +51,7 @@
 #   - jamf-cli installed and configured
 #     Install: https://github.com/Jamf-Concepts/jamf-cli
 #     Setup:   https://github.com/Jamf-Concepts/jamf-cli/wiki/Setup-Guide
-#   - python3 (required for compliance; auto-installed if missing)
+#   - jq (bundled in macOS 15+; install via: brew install jq)
 #   - Classic API client (required for static groups)
 #
 # Author: Matt Jerome, Fanatics — Senior Desktop Engineer
@@ -70,6 +72,8 @@ CLIENT_ID=""
 CLIENT_SECRET=""
 RESTORE_SOURCE=""
 RESTORE_TARGET_URL=""
+TARGET_PROFILE=""
+TARGET_TENANT_ID=""
 NO_PROMPT=false
 OVERWRITE_ALL=false
 SCRIPT_MODE="backup"
@@ -93,9 +97,18 @@ function debugLog() {
 # =============================================================================
 
 function preflight() {
-    if [[ ! -d "$OUTPUT_DIR" ]]; then
-        mkdir -p "$OUTPUT_DIR"
+    if [[ "$SCRIPT_MODE" == "restore" ]]; then
+        # In restore mode OUTPUT_DIR is never written to — only RESTORE_DIR is read.
+        # Don't create it. If the caller passed --output-dir, note the mismatch.
+        if [[ -n "$custom_output_dir" ]]; then
+            updateScriptLog "NOTE: --output-dir is ignored in restore mode (use --source to specify the backup path)."
+        fi
+    else
+        if [[ ! -d "$OUTPUT_DIR" ]]; then
+            mkdir -p "$OUTPUT_DIR"
+        fi
     fi
+
     if [[ ! -f "$scriptLog" ]]; then
         touch "$scriptLog"
     fi
@@ -109,6 +122,12 @@ function preflight() {
     fi
     updateScriptLog "jamf-cli detected: $(jamf-cli version 2>/dev/null | head -1)"
 
+    if ! command -v jq &>/dev/null; then
+        updateScriptLog "ERROR: jq not found. Install with: brew install jq"
+        exit 1
+    fi
+    updateScriptLog "jq detected: $(jq --version 2>/dev/null)"
+
     local configList
     configList=$(jamf-cli config list 2>&1)
     if [[ "$configList" == *"No Profiles Configured"* ]] || [[ "$configList" == "[]" ]]; then
@@ -119,12 +138,14 @@ function preflight() {
     updateScriptLog "jamf-cli profile(s) detected."
 
     # Extract tenant ID from config for Platform API calls
-    TENANT_ID=$(echo "$configList" | grep -o '"tenant-id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/"tenant-id"[[:space:]]*:[[:space:]]*"//;s/"$//')
+    TENANT_ID=$(echo "$configList" | jq -r '.[0]."tenant-id" // ""' 2>/dev/null)
     if [[ -n "$TENANT_ID" ]]; then
         updateScriptLog "Tenant ID: $TENANT_ID"
     fi
 
-    updateScriptLog "Output directory: $OUTPUT_DIR"
+    if [[ "$SCRIPT_MODE" == "backup" ]]; then
+        updateScriptLog "Output directory: $OUTPUT_DIR"
+    fi
 }
 
 # =============================================================================
@@ -155,19 +176,13 @@ function ucfirst() {
 # ---------------------------------------------------------------------------
 function parseJsonIdName() {
     local json="$1"
-
-    local ids names
-    ids=$(echo "$json" | \
-        grep -o '"id"[[:space:]]*:[[:space:]]*"*[0-9a-zA-Z_-]*"*' | \
-        sed 's/"id"[[:space:]]*:[[:space:]]*//;s/"//g' | \
-        grep -v '^$')
-
-    names=$(echo "$json" | \
-        grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | \
-        sed 's/"name"[[:space:]]*:[[:space:]]*"//;s/"$//')
-
-    debugLog "parseJsonIdName: $(echo "$ids" | grep -c .) IDs, $(echo "$names" | grep -c .) names extracted"
-    paste <(echo "$ids") <(echo "$names") | grep -v $'^\t$'
+    local result
+    result=$(echo "$json" | jq -r '
+        (if type == "array" then . else .results // .items // . end) |
+        .[] | [(.id | tostring), (.name // "")] | @tsv
+    ' 2>/dev/null | grep -v $'^\t$')
+    debugLog "parseJsonIdName: $(echo "$result" | grep -c .) entries extracted"
+    echo "$result"
 }
 
 # ---------------------------------------------------------------------------
@@ -211,43 +226,27 @@ JAMF_TOKEN=""
 function getJamfToken() {
     [[ -n "$JAMF_TOKEN" ]] && return 0
 
-    if ! getJamfURL; then
-        return 1
-    fi
-
     if [[ -z "$CLIENT_ID" ]] || [[ -z "$CLIENT_SECRET" ]]; then
         updateScriptLog "  ERROR: Classic API credentials not provided."
         updateScriptLog "  Re-run with: --client-id <id> --client-secret <secret>"
+        updateScriptLog "  Or set env vars: JAMF_CLIENT_ID / JAMF_CLIENT_SECRET"
         updateScriptLog "  Create an API client in Jamf Pro: Settings → System → API Roles and Clients"
         return 1
     fi
 
-    updateScriptLog "  Obtaining Classic API token via OAuth client credentials..."
+    updateScriptLog "  Obtaining Classic API token via jamf-cli..."
 
-    local response http_code
-    response=$(curl -s -w "\n__HTTP_CODE__:%{http_code}" -X POST \
-        "${JAMF_URL}/api/oauth/token" \
-        -H "Content-Type: application/x-www-form-urlencoded" \
-        -d "grant_type=client_credentials&client_id=${CLIENT_ID}&client_secret=${CLIENT_SECRET}" \
-        2>>"${scriptLog}")
-
-    http_code=$(echo "$response" | grep "__HTTP_CODE__:" | sed 's/.*__HTTP_CODE__://')
-    response=$(echo "$response" | grep -v "__HTTP_CODE__:")
-
-    if [[ "$http_code" == "200" ]]; then
-        JAMF_TOKEN=$(echo "$response" | /usr/bin/python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-print(data.get('access_token', ''))
-" 2>/dev/null)
-    fi
+    local auth_json
+    auth_json=$(JAMF_CLIENT_ID="$CLIENT_ID" JAMF_CLIENT_SECRET="$CLIENT_SECRET" \
+        jamf-cli pro auth token 2>/dev/null)
+    JAMF_TOKEN=$(echo "$auth_json" | jq -r '.token // .access_token // ""' 2>/dev/null)
 
     if [[ -z "$JAMF_TOKEN" ]]; then
-        updateScriptLog "  ERROR: OAuth token request failed (HTTP ${http_code}): ${response:0:100}"
+        updateScriptLog "  ERROR: Could not obtain Classic API token via jamf-cli."
         return 1
     fi
 
-    updateScriptLog "  Classic API token obtained successfully."
+    updateScriptLog "  Classic API token obtained."
     return 0
 }
 
@@ -260,12 +259,67 @@ PLATFORM_TOKEN=""
 
 function getPlatformToken() {
     [[ -n "$PLATFORM_TOKEN" ]] && return 0
-    PLATFORM_TOKEN=$(jamf-cli pro auth token --field token 2>/dev/null)
+    local auth_json
+    auth_json=$(jamf-cli pro auth token 2>/dev/null)
+    PLATFORM_TOKEN=$(echo "$auth_json" | jq -r '.token // ""' 2>/dev/null)
     if [[ -z "$PLATFORM_TOKEN" ]]; then
         updateScriptLog "  ERROR: Could not obtain Platform API token via jamf-cli."
         return 1
     fi
     return 0
+}
+
+# ---------------------------------------------------------------------------
+# jamf-cli [args...]
+# Wrapper around jamf-cli that injects --profile <TARGET_PROFILE> when set.
+# Use for all jamf-cli calls inside restore functions so they hit the
+# target instance rather than the default configured profile.
+# ---------------------------------------------------------------------------
+function jamf-cli() {
+    if [[ -n "$TARGET_PROFILE" ]]; then
+        jamf-cli --profile "$TARGET_PROFILE" "$@"
+    else
+        jamf-cli "$@"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# resolveTargetProfile
+# When --target-profile is set, extracts the Jamf URL and Tenant ID
+# from that profile's config and populates RESTORE_TARGET_URL and
+# TARGET_TENANT_ID (unless already explicitly provided by the caller).
+# ---------------------------------------------------------------------------
+function resolveTargetProfile() {
+    [[ -z "$TARGET_PROFILE" ]] && return 0
+
+    updateScriptLog "  Resolving target profile: $TARGET_PROFILE"
+
+    local config
+    config=$(jamf-cli config list 2>&1)
+
+    # Derive target URL from profile unless --target-url was explicitly passed
+    if [[ -z "$RESTORE_TARGET_URL" ]]; then
+        RESTORE_TARGET_URL=$(echo "$config" | jq -r --arg p "$TARGET_PROFILE" \
+            '.[] | select(.name == $p) | .url // ""' 2>/dev/null)
+        if [[ -n "$RESTORE_TARGET_URL" ]]; then
+            updateScriptLog "  Target URL  : $RESTORE_TARGET_URL (from profile '$TARGET_PROFILE')"
+        else
+            updateScriptLog "  WARNING: Could not derive URL from profile '$TARGET_PROFILE' — Classic API calls may fail."
+            updateScriptLog "           Pass --target-url <url> to override."
+        fi
+    fi
+
+    # Derive tenant ID from profile unless --target-tenant-id was explicitly passed
+    if [[ -z "$TARGET_TENANT_ID" ]]; then
+        TARGET_TENANT_ID=$(echo "$config" | jq -r --arg p "$TARGET_PROFILE" \
+            '.[] | select(.name == $p) | ."tenant-id" // ""' 2>/dev/null)
+        if [[ -n "$TARGET_TENANT_ID" ]]; then
+            updateScriptLog "  Target Tenant ID: $TARGET_TENANT_ID (from profile '$TARGET_PROFILE')"
+        else
+            updateScriptLog "  WARNING: Could not derive Tenant ID from profile '$TARGET_PROFILE' — smart group restore may fail."
+            updateScriptLog "           Pass --target-tenant-id <id> to override."
+        fi
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -317,19 +371,17 @@ function classicApiExists() {
         return 1
     fi
 
-    # URL-encode the name (replace spaces with %20, basic encoding)
     local encoded_name
-    encoded_name=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$name" 2>/dev/null || echo "$name")
+    encoded_name=$(printf '%s' "$name" | jq -sRr @uri 2>/dev/null || printf '%s' "$name")
 
-    local response http_code
-    response=$(curl -s -w "\n__HTTP_CODE__:%{http_code}" -X GET \
+    local response http_code tmpbody
+    tmpbody=$(mktemp)
+    http_code=$(curl -s -o "$tmpbody" -w "%{http_code}" -X GET \
         "${JAMF_URL}${endpoint}${encoded_name}" \
         -H "accept: application/xml" \
         -H "Authorization: Bearer ${JAMF_TOKEN}" \
         2>>"${scriptLog}")
-
-    http_code=$(echo "$response" | grep "__HTTP_CODE__:" | sed 's/.*__HTTP_CODE__://')
-    response=$(echo "$response" | grep -v "__HTTP_CODE__:")
+    response=$(cat "$tmpbody"); rm -f "$tmpbody"
 
     if [[ "$http_code" == "200" ]]; then
         # Extract top-level id from response
@@ -382,49 +434,6 @@ function xmlExtractMembers() {
             }
         }
     '
-}
-
-# =============================================================================
-# Python 3 availability
-# =============================================================================
-
-PYTHON3_BIN=""
-
-function ensurePython3() {
-    if /usr/bin/python3 --version &>/dev/null; then
-        PYTHON3_BIN="/usr/bin/python3"; return 0
-    fi
-
-    local p
-    for p in /opt/homebrew/bin/python3 /usr/local/bin/python3; do
-        if [[ -x "$p" ]]; then PYTHON3_BIN="$p"; return 0; fi
-    done
-
-    updateScriptLog "  python3 not found — attempting install via Xcode Command Line Tools..."
-    local clt_label
-    clt_label=$(softwareupdate -l 2>/dev/null | grep -i "command line tools" | sort -r | head -1 | sed 's/.*\* //' | xargs)
-    if [[ -n "$clt_label" ]]; then
-        updateScriptLog "  Installing: $clt_label"
-        softwareupdate -i "$clt_label" --agree-to-license 2>>"${scriptLog}"
-    fi
-
-    if /usr/bin/python3 --version &>/dev/null; then
-        PYTHON3_BIN="/usr/bin/python3"; return 0
-    fi
-
-    local brew_bin=""
-    for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do
-        [[ -x "$b" ]] && brew_bin="$b" && break
-    done
-    if [[ -n "$brew_bin" ]]; then
-        "$brew_bin" install python3 2>>"${scriptLog}"
-        for p in /opt/homebrew/bin/python3 /usr/local/bin/python3; do
-            if [[ -x "$p" ]]; then PYTHON3_BIN="$p"; return 0; fi
-        done
-    fi
-
-    updateScriptLog "  ERROR: Could not obtain python3."
-    return 1
 }
 
 # =============================================================================
@@ -574,15 +583,14 @@ function computerGroups() {
             return 1
         fi
 
-        local all_groups_xml http_code
-        all_groups_xml=$(curl -s -w "\n__HTTP_CODE__:%{http_code}" -X GET \
+        local all_groups_xml http_code tmpbody
+        tmpbody=$(mktemp)
+        http_code=$(curl -s -o "$tmpbody" -w "%{http_code}" -X GET \
             "${JAMF_URL}/JSSResource/computergroups" \
             -H "accept: application/xml" \
             -H "Authorization: Bearer ${JAMF_TOKEN}" \
             2>>"${scriptLog}")
-
-        http_code=$(echo "$all_groups_xml" | grep "__HTTP_CODE__:" | sed 's/.*__HTTP_CODE__://')
-        all_groups_xml=$(echo "$all_groups_xml" | grep -v "__HTTP_CODE__:")
+        all_groups_xml=$(cat "$tmpbody"); rm -f "$tmpbody"
         updateScriptLog "  /JSSResource/computergroups HTTP status: ${http_code}"
 
         if [[ -z "$all_groups_xml" ]] || [[ "$http_code" != "200" ]]; then
@@ -638,15 +646,14 @@ function computerGroups() {
                 (( success++ )); continue
             fi
 
-            local group_xml group_http_code
-            group_xml=$(curl -s -w "\n__HTTP_CODE__:%{http_code}" -X GET \
+            local group_xml group_http_code tmpbody
+            tmpbody=$(mktemp)
+            group_http_code=$(curl -s -o "$tmpbody" -w "%{http_code}" -X GET \
                 "${JAMF_URL}/JSSResource/computergroups/id/${group_id}" \
                 -H "accept: application/xml" \
                 -H "Authorization: Bearer ${JAMF_TOKEN}" \
                 2>>"${scriptLog}")
-
-            group_http_code=$(echo "$group_xml" | grep "__HTTP_CODE__:" | sed 's/.*__HTTP_CODE__://')
-            group_xml=$(echo "$group_xml" | grep -v "__HTTP_CODE__:")
+            group_xml=$(cat "$tmpbody"); rm -f "$tmpbody"
 
             if [[ -z "$group_xml" ]] || [[ "$group_http_code" != "200" ]]; then
                 updateScriptLog "  WARNING: Bad response for group $group_id (HTTP ${group_http_code})"
@@ -747,9 +754,7 @@ function packages() {
 
     local tmpfile
     tmpfile=$(mktemp /tmp/jamf_jcds_names.XXXXXX)
-    echo "$jcds_json" | \
-        grep -o '"fileName"[[:space:]]*:[[:space:]]*"[^"]*"' | \
-        sed 's/"fileName"[[:space:]]*:[[:space:]]*"//;s/"$//' > "$tmpfile"
+    echo "$jcds_json" | jq -r '.[].fileName // empty' 2>/dev/null > "$tmpfile"
 
     local total
     total=$(wc -l < "$tmpfile" | tr -d ' ')
@@ -836,7 +841,7 @@ function blueprints() {
         fi
 
         local bp_label
-        bp_label=$(echo "$bp_json" | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/"name"[[:space:]]*:[[:space:]]*"//;s/"$//')
+        bp_label=$(echo "$bp_json" | jq -r '.name // ""' 2>/dev/null)
         local safe_name
         safe_name=$(sanitize "$bp_label")
         # Append short ID suffix to ensure uniqueness for unnamed/duplicate-named blueprints
@@ -863,11 +868,6 @@ function blueprints() {
 function compliance() {
     updateScriptLog "--- Exporting compliance benchmarks ---"
 
-    if ! ensurePython3; then
-        updateScriptLog "  Skipping compliance export — python3 unavailable."
-        return 1
-    fi
-
     local dir="${OUTPUT_DIR}/compliance"
     mkdir -p "$dir"
     local success=0 fail=0
@@ -884,16 +884,10 @@ function compliance() {
     local tmpfile
     tmpfile=$(mktemp /tmp/jamf_compliance.XXXXXX)
 
-    "$PYTHON3_BIN" -c "
-import sys, json
-data = json.loads(sys.argv[1])
-if not isinstance(data, list):
-    data = data.get('results', data.get('items', data.get('benchmarks', [])))
-for item in data:
-    bid = item.get('id') or item.get('benchmarkId') or item.get('_id', '')
-    if bid:
-        print(bid)
-" "$list_json" > "$tmpfile" 2>>"${scriptLog}"
+    echo "$list_json" | jq -r '
+        (if type == "array" then . else .results // .items // .benchmarks // . end) |
+        .[] | (.id // .benchmarkId // ._id) // "" | select(. != "")
+    ' 2>/dev/null > "$tmpfile"
 
     local count
     count=$(wc -l < "$tmpfile" | tr -d ' ')
@@ -920,12 +914,7 @@ for item in data:
         fi
 
         local bench_name
-        bench_name=$("$PYTHON3_BIN" -c "
-import sys, json
-data = json.loads(sys.argv[1])
-label = data.get('title') or data.get('baselineId') or data.get('name') or ''
-print(label.strip()[:80])
-" "$bench_json" 2>/dev/null)
+        bench_name=$(echo "$bench_json" | jq -r '(.title // .baselineId // .name // "") | gsub("^\\s+|\\s+$"; "") | .[0:80]' 2>/dev/null)
 
         local safe_name
         safe_name=$(sanitize "$bench_name")
@@ -990,11 +979,6 @@ function appInstallerDeployments() {
     mkdir -p "$dir"
     local success=0 fail=0
 
-    if ! ensurePython3; then
-        updateScriptLog "  Skipping app installer deployments — python3 unavailable."
-        return 1
-    fi
-
     local list_json
     list_json=$(jamf-cli pro app-installer-deployments list -o json 2>/dev/null)
 
@@ -1005,23 +989,9 @@ function appInstallerDeployments() {
 
     echo "$list_json" > "${dir}/_all_deployments.json"
 
-    # Use python3 to extract only top-level id + name fields.
-    # parseJsonIdName uses grep and matches nested ids (smartGroup, category, app)
-    # which produces hundreds of false entries in the complex deployment JSON.
     local tmpfile
     tmpfile=$(mktemp /tmp/jamf_appinstaller.XXXXXX)
-    "$PYTHON3_BIN" -c "
-import sys, json
-data = json.loads(sys.argv[1])
-if not isinstance(data, list):
-    data = data.get('results', data.get('items', []))
-for item in data:
-    if not isinstance(item, dict): continue
-    bid  = str(item.get('id', ''))
-    name = str(item.get('name', ''))
-    if bid:
-        print(f'{bid}	{name}')
-" "$list_json" > "$tmpfile" 2>>"${scriptLog}"
+    parseJsonIdName "$list_json" > "$tmpfile"
 
     local count
     count=$(wc -l < "$tmpfile" | tr -d ' ')
@@ -1143,6 +1113,29 @@ function restorePolicies() {
             if [[ "$http_code" =~ ^2 ]]; then
                 updateScriptLog "  Created: $policy_name"
                 (( success++ ))
+            elif [[ "$http_code" == "409" ]]; then
+                # 409 = already exists but classicApiExists missed it (name encoding,
+                # trailing whitespace, etc.). Re-look up the ID and fall back to PUT.
+                updateScriptLog "  409 conflict on POST — falling back to update for '$policy_name'"
+                EXISTING_ID=""
+                if classicApiExists "$endpoint" "$policy_name"; then
+                    local put_code
+                    put_code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+                        "${JAMF_URL}/JSSResource/policies/id/${EXISTING_ID}" \
+                        -H "Content-Type: application/xml" \
+                        -H "Authorization: Bearer ${JAMF_TOKEN}" \
+                        --data-binary "@${xml_file}" 2>>"${scriptLog}")
+                    if [[ "$put_code" =~ ^2 ]]; then
+                        updateScriptLog "  Updated (409 fallback): $policy_name (ID: $EXISTING_ID)"
+                        (( success++ ))
+                    else
+                        updateScriptLog "  WARNING: 409 fallback PUT failed for '$policy_name' (HTTP $put_code)"
+                        (( fail++ ))
+                    fi
+                else
+                    updateScriptLog "  WARNING: 409 but could not resolve existing ID for '$policy_name'"
+                    (( fail++ ))
+                fi
             else
                 updateScriptLog "  WARNING: Create failed for '$policy_name' (HTTP $http_code)"
                 (( fail++ ))
@@ -1226,6 +1219,27 @@ function restoreProfiles() {
             if [[ "$http_code" =~ ^2 ]]; then
                 updateScriptLog "  Created: $profile_name"
                 (( success++ ))
+            elif [[ "$http_code" == "409" ]]; then
+                updateScriptLog "  409 conflict on POST — falling back to update for '$profile_name'"
+                EXISTING_ID=""
+                if classicApiExists "/JSSResource/osxconfigurationprofiles/name/" "$profile_name"; then
+                    local put_code
+                    put_code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+                        "${JAMF_URL}/JSSResource/osxconfigurationprofiles/id/${EXISTING_ID}" \
+                        -H "Content-Type: application/xml" \
+                        -H "Authorization: Bearer ${JAMF_TOKEN}" \
+                        --data-binary "@${xml_file}" 2>>"${scriptLog}")
+                    if [[ "$put_code" =~ ^2 ]]; then
+                        updateScriptLog "  Updated (409 fallback): $profile_name (ID: $EXISTING_ID)"
+                        (( success++ ))
+                    else
+                        updateScriptLog "  WARNING: 409 fallback PUT failed for '$profile_name' (HTTP $put_code)"
+                        (( fail++ ))
+                    fi
+                else
+                    updateScriptLog "  WARNING: 409 but could not resolve existing ID for '$profile_name'"
+                    (( fail++ ))
+                fi
             else
                 updateScriptLog "  WARNING: Create failed for '$profile_name' (HTTP $http_code)"
                 (( fail++ ))
@@ -1311,6 +1325,27 @@ function restoreStaticGroups() {
             if [[ "$http_code" =~ ^2 ]]; then
                 updateScriptLog "  Created: $group_name"
                 (( success++ ))
+            elif [[ "$http_code" == "409" ]]; then
+                updateScriptLog "  409 conflict on POST — falling back to update for '$group_name'"
+                EXISTING_ID=""
+                if classicApiExists "/JSSResource/computergroups/name/" "$group_name"; then
+                    local put_code
+                    put_code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+                        "${JAMF_URL}/JSSResource/computergroups/id/${EXISTING_ID}" \
+                        -H "Content-Type: application/xml" \
+                        -H "Authorization: Bearer ${JAMF_TOKEN}" \
+                        --data-binary "@${xml_file}" 2>>"${scriptLog}")
+                    if [[ "$put_code" =~ ^2 ]]; then
+                        updateScriptLog "  Updated (409 fallback): $group_name (ID: $EXISTING_ID)"
+                        (( success++ ))
+                    else
+                        updateScriptLog "  WARNING: 409 fallback PUT failed for '$group_name' (HTTP $put_code)"
+                        (( fail++ ))
+                    fi
+                else
+                    updateScriptLog "  WARNING: 409 but could not resolve existing ID for '$group_name'"
+                    (( fail++ ))
+                fi
             else
                 updateScriptLog "  WARNING: Create failed for '$group_name' (HTTP $http_code)"
                 (( fail++ ))
@@ -1336,8 +1371,12 @@ function restoreSmartGroups() {
         return
     fi
 
-    if [[ -z "$TENANT_ID" ]]; then
-        updateScriptLog "  ERROR: Tenant ID not found. Cannot restore smart groups via Platform API."
+    # Use TARGET_TENANT_ID if set (cross-instance restore), otherwise fall back
+    # to the source tenant extracted at preflight
+    local effective_tenant="${TARGET_TENANT_ID:-$TENANT_ID}"
+    if [[ -z "$effective_tenant" ]]; then
+        updateScriptLog "  ERROR: No Tenant ID available for smart group restore."
+        updateScriptLog "  Use --target-profile <profile> or --target-tenant-id <id>."
         return 1
     fi
 
@@ -1346,7 +1385,7 @@ function restoreSmartGroups() {
         return 1
     fi
 
-    local platform_base="https://us.apigw.jamf.com/api/pro/v2/tenant/${TENANT_ID}"
+    local platform_base="https://us.apigw.jamf.com/api/pro/v2/tenant/${effective_tenant}"
     local success=0 fail=0 skipped=0
     local json_file
 
@@ -1354,7 +1393,7 @@ function restoreSmartGroups() {
         [[ -f "$json_file" ]] || continue
 
         local group_name
-        group_name=$(grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' "$json_file" | head -1 | sed 's/"name"[[:space:]]*:[[:space:]]*"//;s/"$//')
+        group_name=$(jq -r '.name // ""' "$json_file")
 
         updateScriptLog "  Smart group: $group_name"
 
@@ -1365,25 +1404,19 @@ function restoreSmartGroups() {
 
         # Check if group exists via Platform API
         local check_response check_code
-        local encoded_name
-        encoded_name=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$group_name" 2>/dev/null || echo "$group_name")
-        check_response=$(curl -s -w "\n__HTTP_CODE__:%{http_code}" -X GET \
+        local encoded_name tmpbody
+        encoded_name=$(printf '%s' "$group_name" | jq -sRr @uri 2>/dev/null || printf '%s' "$group_name")
+        tmpbody=$(mktemp)
+        check_code=$(curl -s -o "$tmpbody" -w "%{http_code}" -X GET \
             "${platform_base}/computer-groups/smart-groups?name=${encoded_name}" \
             -H "accept: application/json" \
             -H "Authorization: Bearer ${PLATFORM_TOKEN}" \
             2>>"${scriptLog}")
-        check_code=$(echo "$check_response" | grep "__HTTP_CODE__:" | sed 's/.*__HTTP_CODE__://')
-        check_response=$(echo "$check_response" | grep -v "__HTTP_CODE__:")
+        check_response=$(cat "$tmpbody"); rm -f "$tmpbody"
 
         local existing_count
-        existing_count=$(echo "$check_response" | python3 -c "
-import sys,json
-try:
-    d=json.load(sys.stdin)
-    results=d.get('results',d if isinstance(d,list) else [])
-    print(len([r for r in results if r.get('name','')=='$(echo "$group_name" | sed "s/'/'\\''/g")']))
-except: print(0)
-" 2>/dev/null)
+        existing_count=$(echo "$check_response" | jq -r --arg n "$group_name" \
+            '[(.results // .) | .[] | select(.name == $n)] | length' 2>/dev/null)
 
         if [[ "$existing_count" -gt 0 ]]; then
             restorePrompt "Smart group" "$group_name"
@@ -1393,15 +1426,8 @@ except: print(0)
             fi
             # Delete existing then recreate (Platform API has no PUT for smart groups)
             local del_id
-            del_id=$(echo "$check_response" | python3 -c "
-import sys,json
-try:
-    d=json.load(sys.stdin)
-    results=d.get('results',d if isinstance(d,list) else [])
-    match=[r for r in results if r.get('name','')=='$(echo "$group_name" | sed "s/'/'\\''/g")']
-    print(match[0].get('id','')) if match else print('')
-except: print('')
-" 2>/dev/null)
+            del_id=$(echo "$check_response" | jq -r --arg n "$group_name" \
+                '[(.results // .) | .[] | select(.name == $n)][0].id // ""' 2>/dev/null)
             if [[ -n "$del_id" ]]; then
                 curl -s -X DELETE \
                     "${platform_base}/computer-groups/smart-groups/${del_id}" \
@@ -1423,6 +1449,11 @@ except: print('')
         if [[ "$post_code" =~ ^2 ]]; then
             updateScriptLog "  Restored: $group_name"
             (( success++ ))
+        elif [[ "$post_code" == "409" ]]; then
+            # Group still exists (delete may have silently failed or name differs).
+            # Log as a warning but don't count as a hard failure — the group is present.
+            updateScriptLog "  WARNING: 409 conflict — '$group_name' already exists in target; skipping."
+            (( skipped++ ))
         else
             updateScriptLog "  WARNING: Failed to restore smart group '$group_name' (HTTP $post_code)"
             (( fail++ ))
@@ -1467,7 +1498,7 @@ function restorePackages() {
         # Check if package already exists by filename
         local existing
         existing=$(jamf-cli pro packages list -o json 2>/dev/null | \
-            grep -o "\"fileName\"[[:space:]]*:[[:space:]]*\"${pkg_filename}\"" | head -1)
+            jq -r --arg fn "$pkg_filename" '.[] | select(.fileName == $fn) | .id // ""' | head -1)
 
         if [[ -n "$existing" ]]; then
             restorePrompt "Package" "$pkg_filename"
@@ -1534,7 +1565,7 @@ function restoreBlueprints() {
     while IFS= read -r json_file; do
         [[ -f "$json_file" ]] || continue
         local bp_name
-        bp_name=$(grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' "$json_file" | head -1 | sed 's/"name"[[:space:]]*:[[:space:]]*"//;s/"$//')
+        bp_name=$(jq -r '.name // ""' "$json_file")
         updateScriptLog "  Blueprint: $bp_name"
 
         if [[ "$DRY_RUN" == "true" ]]; then
@@ -1545,7 +1576,7 @@ function restoreBlueprints() {
         # Check if blueprint exists
         local existing
         existing=$(jamf-cli pro blueprints list -o json 2>/dev/null | \
-            grep -o "\"name\"[[:space:]]*:[[:space:]]*\"${bp_name}\"" | head -1)
+            jq -r --arg name "$bp_name" '.[] | select(.name == $name) | .id // ""' | head -1)
 
         if [[ -n "$existing" ]]; then
             restorePrompt "Blueprint" "$bp_name"
@@ -1595,7 +1626,7 @@ function restoreAppInstallerDeployments() {
         [[ -f "$json_file" ]] || continue
 
         local app_name
-        app_name=$(grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' "$json_file" | head -1 | sed 's/"name"[[:space:]]*:[[:space:]]*"//;s/"$//')
+        app_name=$(jq -r '.name // ""' "$json_file")
         updateScriptLog "  App installer: $app_name"
 
         # ── Artifact detection ──────────────────────────────────────────────
@@ -1649,7 +1680,7 @@ function restoreAppInstallerDeployments() {
         # Check if deployment exists by name
         local existing
         existing=$(jamf-cli pro app-installer-deployments list -o json 2>/dev/null | \
-            grep -o "\"name\"[[:space:]]*:[[:space:]]*\"${app_name}\"" | head -1)
+            jq -r --arg name "$app_name" '.[] | select(.name == $name) | .id // ""' | head -1)
 
         if [[ -n "$existing" ]]; then
             restorePrompt "App installer deployment" "$app_name"
@@ -1771,7 +1802,7 @@ function restorePrinters() {
         # Check if printer already exists by name
         local existing
         existing=$(jamf-cli pro classic-printers list -o json 2>/dev/null | \
-            grep -o "\"name\"[[:space:]]*:[[:space:]]*\"${printer_name}\"" | head -1)
+            jq -r --arg name "$printer_name" '.[] | select(.name == $name) | .id // ""' | head -1)
 
         if [[ -n "$existing" ]]; then
             restorePrompt "Printer" "$printer_name"
@@ -1795,6 +1826,124 @@ function restorePrinters() {
         updateScriptLog "Printers restore complete (DRY-RUN): previewed, no changes made"
     else
         updateScriptLog "Printers restore complete: $success restored, $skipped skipped, $fail failed"
+    fi
+}
+
+# =============================================================================
+# Scripts backup  (Classic API — jamf-cli pro classic-scripts)
+# =============================================================================
+
+function scripts() {
+    updateScriptLog "--- Exporting scripts ---"
+    local dir="${OUTPUT_DIR}/scripts"
+    mkdir -p "$dir"
+    local success=0 fail=0
+
+    local list_json
+    list_json=$(jamf-cli pro classic-scripts list -o json 2>/dev/null)
+    updateScriptLog "  List response: $(echo "$list_json" | wc -c | tr -d ' ') bytes"
+
+    local tmpfile
+    tmpfile=$(mktemp /tmp/jamf_scripts.XXXXXX)
+    parseJsonIdName "$list_json" > "$tmpfile"
+
+    local count
+    count=$(wc -l < "$tmpfile" | tr -d ' ')
+    if [[ "$count" -eq 0 ]]; then
+        updateScriptLog "  No scripts found."
+        rm -f "$tmpfile"
+        return
+    fi
+    updateScriptLog "  Found $count scripts."
+
+    while IFS=$'\t' read -r script_id script_name; do
+        [[ -z "$script_id" ]] && continue
+        local safe_name
+        safe_name=$(sanitize "$script_name")
+        updateScriptLog "  Script: $script_name (ID: $script_id)"
+        if [[ "$DRY_RUN" == "true" ]]; then
+            updateScriptLog "  [DRY-RUN] jamf-cli pro classic-scripts get $script_id -o xml > ${dir}/${safe_name}.xml"
+            (( success++ ))
+        elif jamf-cli pro classic-scripts get "$script_id" -o xml \
+               > "${dir}/${safe_name}.xml" 2>>"${scriptLog}" && [[ -s "${dir}/${safe_name}.xml" ]]; then
+            (( success++ ))
+        else
+            updateScriptLog "  WARNING: Failed to export script ID $script_id"
+            rm -f "${dir}/${safe_name}.xml"
+            (( fail++ ))
+        fi
+    done < "$tmpfile"
+
+    rm -f "$tmpfile"
+    updateScriptLog "Scripts complete: $success exported, $fail failed → $dir"
+}
+
+# =============================================================================
+# restoreScripts
+# Restores scripts via jamf-cli pro classic-scripts apply --from-file.
+# =============================================================================
+
+function restoreScripts() {
+    updateScriptLog "--- Restoring scripts ---"
+    local dir="${RESTORE_DIR}/scripts"
+
+    if [[ ! -d "$dir" ]]; then
+        updateScriptLog "  No scripts folder found in backup: $dir"
+        return
+    fi
+
+    local xml_count
+    xml_count=$(find "$dir" -maxdepth 1 -name "*.xml" | wc -l | tr -d ' ')
+    if [[ "$xml_count" -eq 0 ]]; then
+        updateScriptLog "  No script XML files found in $dir"
+        return
+    fi
+    updateScriptLog "  Found $xml_count script files."
+
+    local success=0 fail=0 skipped=0
+
+    while IFS= read -r xml_file; do
+        [[ -f "$xml_file" ]] || continue
+
+        local script_name
+        script_name=$(sed 's/></></g' "$xml_file" | awk '
+            /<name>.*<\/name>/ {
+                gsub(/^[[:space:]]*<name>/, ""); gsub(/<\/name>.*/, ""); print; exit
+            }')
+
+        updateScriptLog "  Script: $script_name"
+
+        if [[ "$DRY_RUN" == "true" ]]; then
+            updateScriptLog "  [DRY-RUN] jamf-cli pro classic-scripts apply --from-file $xml_file --yes"
+            continue
+        fi
+
+        local existing
+        existing=$(jamf-cli pro classic-scripts list -o json 2>/dev/null | \
+            jq -r --arg name "$script_name" '.[] | select(.name == $name) | .id // ""' | head -1)
+
+        if [[ -n "$existing" ]]; then
+            restorePrompt "Script" "$script_name"
+            if [[ "$RESTORE_ACTION" == "skip" ]]; then
+                updateScriptLog "  Skipped: $script_name"
+                (( skipped++ ))
+                continue
+            fi
+        fi
+
+        if jamf-cli pro classic-scripts apply --from-file "$xml_file" --yes 2>>"${scriptLog}"; then
+            updateScriptLog "  Restored: $script_name"
+            (( success++ ))
+        else
+            updateScriptLog "  WARNING: Failed to restore script '$script_name'"
+            (( fail++ ))
+        fi
+    done < <(find "$dir" -maxdepth 1 -name "*.xml")
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        updateScriptLog "Scripts restore complete (DRY-RUN): previewed, no changes made"
+    else
+        updateScriptLog "Scripts restore complete: $success restored, $skipped skipped, $fail failed"
     fi
 }
 
@@ -1823,17 +1972,25 @@ Backup/Restore targets (use with either mode):
   --computers              Computer inventory — backup only, read-only
   --app-installers         App installer deployments (JSON)
   --printers               Printers (XML per printer)
+  --scripts                Scripts (XML per script)
 
 Restore options:
   --source <path>          Dated backup folder to restore from
                            Default: most recent under output-dir
-  --target-url <url>       Jamf Pro URL to restore to
+  --target-url <url>       Jamf Pro URL to restore to (Classic API)
                            Default: current instance
+  --target-profile <name>  jamf-cli profile for the target instance
+                           Automatically sets --target-url and --target-tenant-id
+                           from that profile's config
+  --target-tenant-id <id>  Tenant ID for the target instance (Platform API)
+                           Derived automatically from --target-profile if omitted
   --no-prompt              Skip all conflict prompts; overwrite everything
 
 Global options:
   --client-id      OAuth client ID for Classic API (static groups)
+                   Env var: JAMF_CLIENT_ID
   --client-secret  OAuth client secret for Classic API
+                   Env var: JAMF_CLIENT_SECRET
   --output-dir <path>      Base directory (default: ~/Desktop/Jamf_Pro_Backup)
   --log-file <path>        Log file path (default: <output-dir>/jamf_cli_logs.log)
   -n, --dry-run            Preview without executing
@@ -1856,6 +2013,12 @@ Examples:
 
   # Restore most recent backup to same instance
   ./jamf_backup.sh --mode restore --all \\
+    --client-id CLIENT_ID --client-secret CLIENT_SECRET
+
+  # Restore to a different Jamf instance using a configured jamf-cli profile
+  ./jamf_backup.sh --mode restore --all --no-prompt \\
+    --source ~/Desktop/Jamf_Pro_Backup/2026_05_28 \\
+    --target-profile newinstance \\
     --client-id CLIENT_ID --client-secret CLIENT_SECRET
 
   # Restore specific backup to new instance, no prompts
@@ -1889,6 +2052,7 @@ run_compliance=false
 run_computers=false
 run_app_installers=false
 run_printers=false
+run_scripts=false
 run_all=false
 unknown_args=()
 custom_output_dir=""
@@ -1918,6 +2082,7 @@ while [[ $i -lt ${#args[@]} ]]; do
         --computers)        run_computers=true ;;
         --app-installers)   run_app_installers=true ;;
         --printers)         run_printers=true ;;
+        --scripts)          run_scripts=true ;;
         --help)             showHelp; exit 0 ;;
         --output-dir)
             (( i++ ))
@@ -1946,6 +2111,20 @@ while [[ $i -lt ${#args[@]} ]]; do
             ;;
         --target-url=*)
             RESTORE_TARGET_URL="${arg#--target-url=}"
+            ;;
+        --target-profile)
+            (( i++ ))
+            TARGET_PROFILE="${args[$i]}"
+            ;;
+        --target-profile=*)
+            TARGET_PROFILE="${arg#--target-profile=}"
+            ;;
+        --target-tenant-id)
+            (( i++ ))
+            TARGET_TENANT_ID="${args[$i]}"
+            ;;
+        --target-tenant-id=*)
+            TARGET_TENANT_ID="${arg#--target-tenant-id=}"
             ;;
         --no-prompt)
             NO_PROMPT=true
@@ -1980,6 +2159,10 @@ if [[ ${#unknown_args[@]} -gt 0 ]]; then
     showHelp
     exit 1
 fi
+
+# Env var fallbacks for Classic API credentials (override with --client-id / --client-secret)
+[[ -z "$CLIENT_ID" ]]     && CLIENT_ID="${JAMF_CLIENT_ID:-}"
+[[ -z "$CLIENT_SECRET" ]] && CLIENT_SECRET="${JAMF_CLIENT_SECRET:-}"
 
 if [[ "$SCRIPT_MODE" != "backup" ]] && [[ "$SCRIPT_MODE" != "restore" ]]; then
     echo "ERROR: --mode must be 'backup' or 'restore' (got: '$SCRIPT_MODE')"
@@ -2025,6 +2208,7 @@ if [[ "$SCRIPT_MODE" == "backup" ]]; then
         computers
         appInstallerDeployments
         printers
+        scripts
     else
         $run_policies       && policies
         $run_profiles       && profiles
@@ -2036,6 +2220,7 @@ if [[ "$SCRIPT_MODE" == "backup" ]]; then
         $run_computers      && computers
         $run_app_installers && appInstallerDeployments
         $run_printers       && printers
+        $run_scripts        && scripts
     fi
 
     updateScriptLog "=== Backup complete → $OUTPUT_DIR ==="
@@ -2044,6 +2229,9 @@ if [[ "$SCRIPT_MODE" == "backup" ]]; then
 elif [[ "$SCRIPT_MODE" == "restore" ]]; then
     findRestoreSource
     updateScriptLog "=== Starting restore from $RESTORE_DIR ==="
+
+    # If --target-profile was given, derive URL and tenant ID from it now
+    resolveTargetProfile
 
     if [[ "$NO_PROMPT" == "true" ]]; then
         updateScriptLog "  No-prompt mode: all conflicts will be overwritten automatically."
@@ -2074,6 +2262,7 @@ elif [[ "$SCRIPT_MODE" == "restore" ]]; then
         restoreBlueprints
         restoreAppInstallerDeployments
         restorePrinters
+        restoreScripts
         updateScriptLog "  NOTE: computers/ and compliance/ are read-only exports — not restored."
     else
         $run_policies       && restorePolicies
@@ -2084,6 +2273,7 @@ elif [[ "$SCRIPT_MODE" == "restore" ]]; then
         $run_blueprints     && restoreBlueprints
         $run_app_installers && restoreAppInstallerDeployments
         $run_printers       && restorePrinters
+        $run_scripts        && restoreScripts
         if $run_compliance || $run_computers; then
             updateScriptLog "  NOTE: computers/ and compliance/ are read-only exports — not restored."
         fi
