@@ -393,19 +393,8 @@ def build_policy_record(policy: dict) -> dict:
 # Output writers
 # ---------------------------------------------------------------------------
 
-def _stamp(path: Optional[str]) -> Optional[str]:
-    """Insert a YYYYMMDD_HHMMSS timestamp before the file extension."""
-    if not path:
-        return path
-    import os
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    base, ext = os.path.splitext(path)
-    return f"{base}_{ts}{ext}"
-
-
 def write_json(records: list[dict], output_file: Optional[str]) -> None:
     out = json.dumps(records, indent=2, default=str)
-    output_file = _stamp(output_file)
     if output_file:
         with open(output_file, "w") as f:
             f.write(out)
@@ -504,7 +493,6 @@ def write_text_summary(records: list[dict], output_file: Optional[str]) -> None:
     lines.append(sep)
     output = "\n".join(lines)
 
-    output_file = _stamp(output_file)
     if output_file:
         with open(output_file, "w") as f:
             f.write(output)
@@ -538,7 +526,9 @@ def _scope_summary(sc: dict) -> str:
     return "; ".join(p for p in parts if p)
 
 
-def write_csv(records: list[dict], output_file: Optional[str]) -> None:
+def write_csv(records: list[dict], output_file: Optional[str],
+              pkg_path: Optional[str] = None,
+              script_path: Optional[str] = None) -> None:
     """
     Write THREE CSV files (or three sections to stdout):
       1. policies.csv        — one row per policy, all general/scope/maintenance fields
@@ -727,18 +717,6 @@ def write_csv(records: list[dict], output_file: Optional[str]) -> None:
             w.writerows(rows)
             print(f"\n### {label} ###")
             print(buf.getvalue())
-
-    # Derive sibling filenames from the base output path, with timestamp
-    if output_file:
-        import os
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        base, ext = os.path.splitext(output_file)
-        # Insert timestamp before extension: policies.csv → policies_20240506_143022.csv
-        output_file = f"{base}_{ts}{ext}"
-        pkg_path    = f"{base}_packages_{ts}{ext}"
-        script_path = f"{base}_scripts_{ts}{ext}"
-    else:
-        pkg_path = script_path = None
 
     _write(policy_rows, policy_fields, output_file, "policies")
     _write(pkg_rows,    pkg_fields,    pkg_path,    "packages")
@@ -1025,16 +1003,7 @@ def write_xlsx(records: list[dict], output_file: Optional[str]) -> None:
               [{h: r.get(k, "") for h, k in zip(script_headers, script_keys)} for r in script_rows])
 
     # ── save ─────────────────────────────────────────────────────────────────
-    import os
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    if output_file:
-        base, ext = os.path.splitext(output_file)
-        if ext.lower() != ".xlsx":
-            ext = ".xlsx"
-        out_path = f"{base}_{ts}{ext}"
-    else:
-        out_path = f"policies_{ts}.xlsx"
-
+    out_path = output_file or f"policies_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
     wb.save(out_path)
     print(
         f"[✓] Written {len(policy_rows)} policies, "
@@ -1101,6 +1070,31 @@ Examples:
 def main() -> None:
     args = parse_args()
     jamf_url = args.url.rstrip("/")
+
+    # Resolve final output path(s) and create file(s) early — fail fast before API work
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_pkg_path: Optional[str] = None
+    csv_script_path: Optional[str] = None
+    if args.output:
+        base, ext = os.path.splitext(args.output)
+        if args.format == "xlsx" and ext.lower() != ".xlsx":
+            ext = ".xlsx"
+        args.output = f"{base}_{ts}{ext}"
+        if args.format == "csv":
+            csv_pkg_path    = f"{base}_packages_{ts}{ext}"
+            csv_script_path = f"{base}_scripts_{ts}{ext}"
+        out_dir = os.path.dirname(os.path.abspath(args.output)) or "."
+        os.makedirs(out_dir, exist_ok=True)
+        try:
+            paths_to_create = [args.output]
+            if args.format == "csv":
+                paths_to_create += [csv_pkg_path, csv_script_path]
+            for p in paths_to_create:
+                open(p, "w").close()
+        except OSError as exc:
+            print(f"[!] Cannot create output file: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(f"[*] Output: {args.output}", file=sys.stderr)
 
     print("[*] Authenticating …", file=sys.stderr)
     try:
@@ -1183,7 +1177,7 @@ def main() -> None:
     if args.format == "json":
         write_json(records, args.output)
     elif args.format == "csv":
-        write_csv(records, args.output)
+        write_csv(records, args.output, csv_pkg_path, csv_script_path)
     elif args.format == "xlsx":
         write_xlsx(records, args.output)
     else:

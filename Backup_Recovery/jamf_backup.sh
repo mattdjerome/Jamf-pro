@@ -176,13 +176,14 @@ function ucfirst() {
 # ---------------------------------------------------------------------------
 function parseJsonIdName() {
     local json="$1"
+    [[ -z "$json" ]] && return
     local result
     result=$(echo "$json" | jq -r '
         (if type == "array" then . else .results // .items // . end) |
         .[] | [(.id | tostring), (.name // "")] | @tsv
     ' 2>/dev/null | grep -v $'^\t$')
     debugLog "parseJsonIdName: $(echo "$result" | grep -c .) entries extracted"
-    echo "$result"
+    [[ -n "$result" ]] && echo "$result"
 }
 
 # ---------------------------------------------------------------------------
@@ -269,19 +270,6 @@ function getPlatformToken() {
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# jamf-cli [args...]
-# Wrapper around jamf-cli that injects --profile <TARGET_PROFILE> when set.
-# Use for all jamf-cli calls inside restore functions so they hit the
-# target instance rather than the default configured profile.
-# ---------------------------------------------------------------------------
-function jamf-cli() {
-    if [[ -n "$TARGET_PROFILE" ]]; then
-        jamf-cli --profile "$TARGET_PROFILE" "$@"
-    else
-        jamf-cli "$@"
-    fi
-}
 
 # ---------------------------------------------------------------------------
 # resolveTargetProfile
@@ -485,7 +473,7 @@ function policies() {
     local success=0 fail=0
 
     local list_json
-    list_json=$(jamf-cli pro classic-policies list -o json 2>/dev/null)
+    list_json=$(jamf-cli pro classic-policies list -o json 2>>"${scriptLog}")
     updateScriptLog "  List response: $(echo "$list_json" | wc -c | tr -d ' ') bytes"
 
     local tmpfile
@@ -526,7 +514,7 @@ function profiles() {
     local success=0 fail=0
 
     local list_json
-    list_json=$(jamf-cli pro classic-macos-config-profiles list -o json 2>/dev/null)
+    list_json=$(jamf-cli pro classic-macos-config-profiles list -o json 2>>"${scriptLog}")
     updateScriptLog "  List response: $(echo "$list_json" | wc -c | tr -d ' ') bytes"
 
     local tmpfile
@@ -682,7 +670,7 @@ function computerGroups() {
     else
         # Smart groups
         local list_json
-        list_json=$(jamf-cli pro smart-computer-groups list -o json 2>/dev/null)
+        list_json=$(jamf-cli pro smart-computer-groups list -o json 2>>"${scriptLog}")
         local raw_bytes
         raw_bytes=$(echo "$list_json" | wc -c | tr -d ' ')
         updateScriptLog "  List response: ${raw_bytes} bytes"
@@ -745,7 +733,7 @@ function packages() {
     local success=0 fail=0 skipped=0
 
     local jcds_json
-    jcds_json=$(jamf-cli pro jcds list -o json 2>/dev/null)
+    jcds_json=$(jamf-cli pro jcds list -o json 2>>"${scriptLog}")
 
     if [[ -z "$jcds_json" ]]; then
         updateScriptLog "ERROR: 'jamf-cli pro jcds list' returned no output."
@@ -804,7 +792,7 @@ function blueprints() {
     local success=0 fail=0
 
     local list_json
-    list_json=$(jamf-cli pro blueprints list -o json 2>/dev/null)
+    list_json=$(jamf-cli pro blueprints list -o json 2>>"${scriptLog}")
 
     local tmpfile
     tmpfile=$(mktemp /tmp/jamf_blueprints.XXXXXX)
@@ -873,7 +861,7 @@ function compliance() {
     local success=0 fail=0
 
     local list_json
-    list_json=$(jamf-cli pro compliance-benchmarks list -o json 2>/dev/null)
+    list_json=$(jamf-cli pro compliance-benchmarks list -o json 2>>"${scriptLog}")
 
     if [[ -z "$list_json" ]]; then
         updateScriptLog "  No response from compliance-benchmarks list."
@@ -944,7 +932,7 @@ function computers() {
     mkdir -p "$dir"
 
     local list_json
-    list_json=$(jamf-cli pro computers list -o json 2>/dev/null)
+    list_json=$(jamf-cli pro computers list -o json 2>>"${scriptLog}")
 
     if [[ -z "$list_json" ]]; then
         updateScriptLog "  ERROR: No response from jamf-cli pro computers list"
@@ -980,7 +968,7 @@ function appInstallerDeployments() {
     local success=0 fail=0
 
     local list_json
-    list_json=$(jamf-cli pro app-installer-deployments list -o json 2>/dev/null)
+    list_json=$(jamf-cli pro app-installer-deployments list -o json 2>>"${scriptLog}")
 
     if [[ -z "$list_json" ]]; then
         updateScriptLog "  ERROR: No response from jamf-cli pro app-installer-deployments list"
@@ -1497,7 +1485,7 @@ function restorePackages() {
 
         # Check if package already exists by filename
         local existing
-        existing=$(jamf-cli pro packages list -o json 2>/dev/null | \
+        existing=$(jamf-cli pro packages list -o json 2>>"${scriptLog}" | \
             jq -r --arg fn "$pkg_filename" '.[] | select(.fileName == $fn) | .id // ""' | head -1)
 
         if [[ -n "$existing" ]]; then
@@ -1575,7 +1563,7 @@ function restoreBlueprints() {
 
         # Check if blueprint exists
         local existing
-        existing=$(jamf-cli pro blueprints list -o json 2>/dev/null | \
+        existing=$(jamf-cli pro blueprints list -o json 2>>"${scriptLog}" | \
             jq -r --arg name "$bp_name" '.[] | select(.name == $name) | .id // ""' | head -1)
 
         if [[ -n "$existing" ]]; then
@@ -1679,7 +1667,7 @@ function restoreAppInstallerDeployments() {
 
         # Check if deployment exists by name
         local existing
-        existing=$(jamf-cli pro app-installer-deployments list -o json 2>/dev/null | \
+        existing=$(jamf-cli pro app-installer-deployments list -o json 2>>"${scriptLog}" | \
             jq -r --arg name "$app_name" '.[] | select(.name == $name) | .id // ""' | head -1)
 
         if [[ -n "$existing" ]]; then
@@ -1721,7 +1709,7 @@ function printers() {
     local success=0 fail=0
 
     local list_json
-    list_json=$(jamf-cli pro classic-printers list -o json 2>/dev/null)
+    list_json=$(jamf-cli pro classic-printers list -o json 2>>"${scriptLog}")
     updateScriptLog "  List response: $(echo "$list_json" | wc -c | tr -d ' ') bytes"
 
     local tmpfile
@@ -1801,7 +1789,7 @@ function restorePrinters() {
 
         # Check if printer already exists by name
         local existing
-        existing=$(jamf-cli pro classic-printers list -o json 2>/dev/null | \
+        existing=$(jamf-cli pro classic-printers list -o json 2>>"${scriptLog}" | \
             jq -r --arg name "$printer_name" '.[] | select(.name == $name) | .id // ""' | head -1)
 
         if [[ -n "$existing" ]]; then
@@ -1840,7 +1828,7 @@ function scripts() {
     local success=0 fail=0
 
     local list_json
-    list_json=$(jamf-cli pro classic-scripts list -o json 2>/dev/null)
+    list_json=$(jamf-cli pro classic-scripts list -o json 2>>"${scriptLog}")
     updateScriptLog "  List response: $(echo "$list_json" | wc -c | tr -d ' ') bytes"
 
     local tmpfile
@@ -1919,7 +1907,7 @@ function restoreScripts() {
         fi
 
         local existing
-        existing=$(jamf-cli pro classic-scripts list -o json 2>/dev/null | \
+        existing=$(jamf-cli pro classic-scripts list -o json 2>>"${scriptLog}" | \
             jq -r --arg name "$script_name" '.[] | select(.name == $name) | .id // ""' | head -1)
 
         if [[ -n "$existing" ]]; then

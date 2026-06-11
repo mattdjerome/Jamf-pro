@@ -56,21 +56,69 @@ def jamf_data(jamf_url, api_token):
     results = response.json()
     return results['results']
 
+def load_existing_csv(path):
+    """Read status and notes from a previous run's CSV to carry forward.
+
+    Matches by serial number if available (new-format CSVs), otherwise by
+    computer name (old-format CSVs that predate serial columns).
+    """
+    name_to_status = {}
+    serial_to_status = {}
+    username_to_notes = {}
+
+    with open(path, newline='') as f:
+        reader = csv.DictReader(f)
+        headers = reader.fieldnames or []
+        has_serials = 'Serial 1' in headers
+
+        for row in reader:
+            uname = (row.get('Username') or '').strip()
+            if not uname or uname[0].isdigit():  # skip blank/metadata rows
+                continue
+
+            username_to_notes[uname.lower()] = (row.get('Notes') or '').strip()
+
+            i = 1
+            while f'Computer {i}' in headers:
+                comp_name = (row.get(f'Computer {i}') or '').strip()
+                status = (row.get(f'Status {i}') or '').strip()
+                serial = (row.get(f'Serial {i}') or '').strip() if has_serials else ''
+
+                if comp_name:
+                    name_to_status[comp_name] = status
+                if serial:
+                    serial_to_status[serial] = status
+
+                i += 1
+
+    return name_to_status, serial_to_status, username_to_notes
+
+
+# Load carryover data from an existing CSV if one was supplied
+name_to_status, serial_to_status, username_to_notes = {}, {}, {}
+if len(sys.argv) > 4:
+    name_to_status, serial_to_status, username_to_notes = load_existing_csv(sys.argv[4])
+
 # Get the list of computers and process them
 computers = jamf_data(baseURL, token)
 users = {}
 execs = ["alowahkee", "camscott"]
 for user in computers:
     username = user['location']['username']
+    if not username:  # skip computers with no assigned user
+        continue
     if username in execs:  # if the username is in execs, skip to the next user
         continue
-    # Ensure the user has a list for storing computer names
+    # Ensure the user has a list for storing computer info
     if username not in users:
         users[username] = []
-
-    # Append the computer name to the user's list
-    users[username].append(user['name'])
-
+    # Append the computer details to the user's list
+    users[username].append({
+        'name': user['name'],
+        'serial': user.get('serialNumber') or '',
+        'asset_tag': user.get('assetTag') or '',
+    })
+    print(user['name'], user.get('serialNumber'), user.get('assetTag'))
 # Check if any user has more than one computer
 multi_computer_users = {user: computers for user, computers in users.items() if len(computers) > 1}
 
@@ -89,6 +137,8 @@ with open(output_csv, mode='w', newline='') as file:
     # Add columns for each computer and corresponding status
     for i in range(max_computers):
         header.append(f'Computer {i+1}')
+        header.append(f'Serial {i+1}')
+        header.append(f'Asset Tag {i+1}')
         header.append(f'Status {i+1}')
     
     # Add 'Notes' column at the end
@@ -100,17 +150,27 @@ with open(output_csv, mode='w', newline='') as file:
     for username, computers in multi_computer_users.items():
         email = f"{username}@fanatics.com"  # Create email by appending @fanatics.com to username
         row = [username, email]  # Include email in the row
-        # Add computer names and empty status columns
+        # Add computer details; carry over status from existing CSV if available
         for i in range(max_computers):
             if i < len(computers):
-                row.append(computers[i])  # Add computer name
-                row.append('')  # Empty status column
+                comp = computers[i]
+                carried_status = (
+                    serial_to_status.get(comp['serial'])
+                    or name_to_status.get(comp['name'])
+                    or ''
+                )
+                row.append(comp['name'])
+                row.append(comp['serial'])
+                row.append(comp['asset_tag'])
+                row.append(carried_status)
             else:
-                row.append('')  # If user has fewer computers, fill with empty cells
                 row.append('')
-        
-        # Add 'Notes' column at the end
-        row.append('')  # Empty notes column
+                row.append('')
+                row.append('')
+                row.append('')
+
+        # Carry over notes from existing CSV if available
+        row.append(username_to_notes.get(username.lower(), ''))
         
         writer.writerow(row)  # Write the user row
 
